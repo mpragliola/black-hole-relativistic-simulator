@@ -1,0 +1,549 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Black Hole</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; font: 13px/1.4 system-ui, sans-serif; color: #cfd6e4; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; cursor: grab; touch-action: none; }
+  canvas:active { cursor: grabbing; }
+  #hud { position: fixed; left: 12px; top: 12px; padding: 10px 12px; background: rgba(8,10,16,.65); border: 1px solid #263044; border-radius: 8px; backdrop-filter: blur(6px); width: 270px; max-height: calc(100% - 48px); overflow-y: auto; }
+  #hud details { margin: 6px 0; border-top: 1px solid #263044; padding-top: 4px; }
+  #hud summary { cursor: pointer; color: #9fb0d0; font-weight: 600; }
+  #hud output { width: 34px; text-align: right; color: #7d8aa3; font-variant-numeric: tabular-nums; }
+  #hud button { margin-top: 6px; background: #1a2336; color: #cfd6e4; border: 1px solid #263044; border-radius: 5px; padding: 3px 8px; cursor: pointer; }
+  #hud label { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin: 4px 0; }
+  #hud input[type=range] { width: 100px; }
+  #hud .row { display: flex; align-items: center; gap: 6px; }
+  #hud small { color: #7d8aa3; display: block; margin-top: 6px; }
+  #hud #collapse { margin: 0; width: 100%; text-align: left; font-weight: 600; color: #9fb0d0; }
+  #hud #hudbody { margin-top: 8px; }
+  #hud.collapsed { width: auto; padding: 6px; }
+  #hud.collapsed #hudbody { display: none; }
+  #hud.collapsed #collapse { width: auto; }
+  #hud .lbl { display: flex; align-items: center; min-width: 0; }
+  .info { display: inline-flex; flex: none; width: 14px; height: 14px; margin-left: 6px; align-items: center; justify-content: center; border: 1px solid #3a4866; border-radius: 50%; color: #8fa2c8; font: italic 600 9px/1 Georgia, serif; cursor: help; user-select: none; }
+  .info:hover, .info:focus-visible, .info.on { background: #26324d; color: #fff; outline: none; }
+  #tip { position: fixed; z-index: 10; display: none; max-width: 300px; padding: 9px 11px; background: #0d1320; border: 1px solid #34425f; border-radius: 8px; color: #d7deec; font-size: 12px; line-height: 1.45; box-shadow: 0 6px 24px rgba(0,0,0,.5); pointer-events: none; }
+  #tip b { color: #fff; display: block; margin-bottom: 3px; }
+  #legend { display: none; margin-top: 8px; }
+  #legend .bar { height: 8px; border-radius: 4px; background: linear-gradient(90deg, rgb(255,26,13), #fff 50%, rgb(13,89,255)); }
+  #legend .lab { display: flex; justify-content: space-between; color: #7d8aa3; font-size: 11px; margin-top: 2px; }
+  #err { position: fixed; inset: 0; display: none; padding: 24px; white-space: pre-wrap; color: #f88; background: #000; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">
+  <button id="collapse" aria-expanded="true" title="Collapse / expand the panel (H)">▾ Controls</button>
+  <div id="hudbody">
+  <div id="ui"></div>
+  <button id="reset">Reset all</button>
+  <div id="legend"><div class="bar"></div><div class="lab"><span>g &lt; 1 redshift</span><span>1</span><span>g &gt; 1 blueshift</span></div></div>
+  <small id="info"></small>
+  <small>Drag: orbit · Wheel/pinch: distance</small>
+  <small>Tip: with the letter grids on, the disk's far side is bent over the hole, so you see its letters again, mirrored, above and below the shadow. The far side bends up over the hole (the hump above the shadow), and a thinner, mirrored copy of it hugs the shadow from below.</small>
+  </div>
+</div>
+<div id="tip" role="tooltip"></div>
+<div id="err"></div>
+
+<script id="fs" type="x-shader/x-fragment">#version 300 es
+precision highp float;
+out vec4 outColor;
+
+uniform vec2  uRes;
+uniform vec3  uCam;      // camera position (units of Schwarzschild radius rs = 1)
+uniform vec3  uRight, uUp, uFwd;
+uniform float uTime;
+uniform float uExposure;
+uniform float uDisk;
+uniform sampler2D uSky;
+uniform float uUseSky;
+uniform sampler2D uGlyph;   // 8x5 atlas: A-Z then 0-9
+
+// Glyph from the atlas. ch = 0..35, l = position inside the cell (x right, y up, both 0..1). Returns coverage 0..1.
+float glyph(int ch, vec2 l) {
+  vec2 g = l * .76 + .12;
+  vec2 cell = vec2(float(ch % 8), float(ch / 8));
+  return textureLod(uGlyph, (cell + vec2(g.x, 1. - g.y)) / vec2(8., 5.), .6).r;
+}
+uniform float uDepth;
+uniform float uDiskTemp, uTurb, uTurbScale;
+uniform float uDiskPattern, uSkyPattern;   // 1 = coloured checkerboard instead of the physical texture
+uniform float uDoppler, uGravRed, uBeamPow, uBeamOn, uShift, uFocal;
+uniform float uRedMap;     // 1 = show g = nu_obs/nu_emit as a false-colour map
+uniform int   uSteps;
+
+const float RS      = 1.0;   // Schwarzschild radius
+const float R_IN    = 3.0;   // innermost stable circular orbit = 3 rs
+const float R_OUT   = 14.0;
+const float R_FAR   = 90.0;
+const int   MAX_STEPS = 900;
+
+float hash21(vec2 p) { p = fract(p * vec2(123.34, 456.21)); p += dot(p, p + 45.32); return fract(p.x * p.y); }
+float hash31(vec3 p) { p = fract(p * vec3(.1031, .1030, .0973)); p += dot(p, p.yxz + 33.33); return fract((p.x + p.y) * p.z); }
+
+float vnoise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  f = f * f * (3. - 2. * f);
+  return mix(mix(hash21(i), hash21(i + vec2(1, 0)), f.x),
+             mix(hash21(i + vec2(0, 1)), hash21(i + vec2(1, 1)), f.x), f.y);
+}
+float fbm(vec2 p) {
+  float s = 0., a = .5;
+  for (int i = 0; i < 5; i++) { s += a * vnoise(p); p = p * 2.03 + 17.1; a *= .5; }
+  return s;
+}
+
+// Approximate blackbody colour for temperature in Kelvin (Tanner Helland fit).
+vec3 blackbody(float T) {
+  float t = clamp(T, 1000., 40000.) / 100.;
+  float r = t <= 66. ? 255. : 329.7 * pow(t - 60., -0.1332);
+  float g = t <= 66. ? 99.47 * log(t) - 161.12 : 288.12 * pow(t - 60., -0.0755);
+  float b = t >= 66. ? 255. : (t <= 19. ? 0. : 138.52 * log(t - 10.) - 305.04);
+  return clamp(vec3(r, g, b) / 255., 0., 1.);
+}
+
+// Background: equirectangular sky image sampled along the final (lensed) ray direction.
+vec3 sky(vec3 d) {
+  if (uSkyPattern > .5) {
+    // lat/long grid: 24 x 12 cells of 15 deg. Rows alternate letters A-X / digits 0-9, so lensed copies read as text.
+    vec2 f = vec2(atan(d.x, -d.z) / 6.28318530718 + .5, acos(clamp(d.y, -1., 1.)) / 3.14159265359) * vec2(24., 12.);
+    vec2 c = floor(f), l = fract(f);
+    int ch = (int(mod(c.y, 2.)) == 0) ? int(c.x) : 26 + int(mod(c.x, 10.));
+    vec3 base = .5 + .5 * cos(6.28318530718 * (c.y / 12. + vec3(0., .33, .67)));
+    vec3 col = base * (d.y > 0. ? .45 : .3);
+    col = mix(col, vec3(1.), glyph(ch, vec2(l.x, 1. - l.y)));
+    float line = 1. - smoothstep(.0, .06, min(min(l.x, 1. - l.x), min(l.y, 1. - l.y)));
+    return mix(col, base * 1.2, line * .8);
+  }
+  if (uUseSky < .5) return vec3(0.);
+  float u = atan(d.x, -d.z) / 6.28318530718 + .5;
+  float v = acos(clamp(d.y, -1., 1.)) / 3.14159265359;
+  // explicit LOD 0: per-pixel derivatives are meaningless after lensing and would show a seam at u = 0/1
+  return pow(textureLod(uSky, vec2(u, v), 0.).rgb, vec3(2.2));   // undo the image's gamma encoding
+}
+
+// Emission from a thin accretion disk at disk-plane point p, seen along ray direction vel
+// (vel points from the camera into the scene, so the photon travels along -vel).
+vec4 shadeDisk(vec3 p, vec3 vel) {
+  float r = length(p.xz);
+  float rin = R_IN, rout = R_OUT;
+  if (r < rin || r > rout) return vec4(0.);
+
+  // Keplerian circular orbit speed in Schwarzschild (M = rs/2): v = sqrt(M / (r - 2M)) = sqrt(.5/(r-1))
+  float beta = min(sqrt(.5 / max(r - 1., .05)), .95) * uDoppler;
+  vec3 tang = normalize(vec3(-p.z, 0., p.x));
+  float gamma = inversesqrt(1. - beta * beta);
+  float doppler = 1. / (gamma * (1. + beta * dot(tang, vel)));
+  float grav    = pow(sqrt(max(1. - RS / r, 0.)), uGravRed);
+  float g = doppler * grav;                       // total frequency ratio nu_obs / nu_emit
+  g = mix(1., g, uShift);
+
+  if (uRedMap > .5) {
+    // false-colour frequency ratio: white g = 1, red g < 1 (redshift), blue g > 1 (blueshift); full colour at a factor of ~1.5
+    float t = clamp(log2(g) / .6, -1., 1.);
+    vec3 col = t < 0. ? mix(vec3(1.), vec3(1., .1, .05), -t) : mix(vec3(1.), vec3(.05, .35, 1.), t);
+    float edge = smoothstep(rin, rin + .3, r) * (1. - smoothstep(rout - 1., rout, r));
+    return vec4(col * .85, edge);
+  }
+
+  if (uDiskPattern > .5) {
+    // Labelled polar grid: 6 rings of roughly square cells, each ring rotating rigidly at its own Keplerian rate.
+    // Letter = sector index (A starts every ring at the same azimuth), text is upright when seen from the near side.
+    float rw = (rout - rin) / 6.;
+    float rv = (r - rin) / rw;
+    float ring = floor(rv), vloc = fract(rv);
+    float rmid = rin + (ring + .5) * rw;
+    float n = max(floor(6.28318530718 * rmid / rw + .5), 6.);
+    float a = atan(p.z, p.x) - sqrt(.5 / (rmid * rmid * rmid)) * uTime * 2.2;
+    float fa = fract(a / 6.28318530718) * n;
+    float sec = floor(fa), uloc = 1. - fract(fa);
+    vec3 rc = .5 + .5 * cos(6.28318530718 * (ring / 6. + vec3(0., .33, .67)));
+    vec3 col = rc * .35;
+    col = mix(col, vec3(1.), glyph(int(mod(sec, 26.)), vec2(uloc, 1. - vloc)));
+    float line = 1. - smoothstep(.0, .05, min(min(uloc, 1. - uloc), min(vloc, 1. - vloc)));
+    col = mix(col, rc * 1.3, line);
+    return vec4(col, 1.);
+  }
+
+  // Temperature profile (Novikov-Thorne-ish)
+  float prof = pow(rin / r, .75) * pow(max(1. - sqrt(rin / r), 0.), .25) * 1.9;
+  float Tobs = uDiskTemp * prof * g;
+
+  // Turbulent clumps, sheared by differential rotation
+  float omega = sqrt(.5 / (r * r * r));
+  float ang = omega * uTime * 2.2;
+  float ca = cos(ang), sa = sin(ang);
+  vec2 q = mat2(ca, -sa, sa, ca) * p.xz;
+  float tex = fbm(q * 1.6 * uTurbScale) * .75 + fbm(q * 5. * uTurbScale) * .45;
+  tex = mix(1., .35 + 1.1 * tex, uTurb);
+
+  float edge = smoothstep(rin, rin + .5, r) * (1. - smoothstep(rout - 5., rout, r));
+  float beam = mix(1., pow(g, uBeamPow), uBeamOn);
+  float I = beam * prof * prof * tex * edge;
+  vec3 c = blackbody(Tobs) * I;
+  float alpha = clamp(edge * (.55 + .5 * tex), 0., .97);
+  return vec4(c, alpha);
+}
+
+// Light rays in Schwarzschild spacetime. A photon stays in one plane through the hole, so each ray is
+// integrated as a planar orbit u(phi) = rs/r with the exact equation
+//     d2u/dphi2 + u = 1.5 * u^2          (rs = 1)
+// using RK4 in the orbit angle phi. Rays that graze the photon sphere (r = 1.5 rs) circle the hole several
+// times; every time they cross the disk plane they pick up disk light. Those higher-order images are
+// the photon ring: nothing is painted there, it emerges from the integration.
+void main() {
+  vec2 uv = (gl_FragCoord.xy - .5 * uRes) / uRes.y;
+  vec3 vel = normalize(uFwd + uFocal * (uv.x * uRight + uv.y * uUp));
+
+  vec3 col = vec3(0.);
+  float trans = 1.;
+  bool escaped = false;
+
+  float r0 = length(uCam);
+  vec3 e1 = uCam / r0;
+  float h = length(cross(uCam, vel));          // impact parameter (conserved)
+
+  if (h < 1e-4) {
+    escaped = dot(uCam, vel) > 0.;             // purely radial ray: straight out, or straight in
+  } else {
+    vec3 e2 = normalize(vel - dot(vel, e1) * e1);   // orbit-plane basis: e1 radial, e2 along the motion
+    float u = 1. / r0;
+    float w = -dot(vel, e1) / h;               // du/dphi
+    float phi = 0., c = 1., s = 0.;
+    float dphi = clamp(36. / float(uSteps), .02, .2);
+    float maxPhi = (uDepth + 1.) * 3.14159265359;
+    float cd = cos(dphi), sd = sin(dphi);
+    float yPrev = uCam.y;
+
+    for (int i = 0; i < MAX_STEPS; i++) {
+      float k1u = w,              k1w = -u + 1.5 * u * u;
+      float u2 = u + .5 * dphi * k1u, w2 = w + .5 * dphi * k1w;
+      float k2u = w2,             k2w = -u2 + 1.5 * u2 * u2;
+      float u3 = u + .5 * dphi * k2u, w3 = w + .5 * dphi * k2w;
+      float k3u = w3,             k3w = -u3 + 1.5 * u3 * u3;
+      float u4 = u + dphi * k3u,  w4 = w + dphi * k3w;
+      float k4u = w4,             k4w = -u4 + 1.5 * u4 * u4;
+      float un = u + dphi / 6. * (k1u + 2. * k2u + 2. * k3u + k4u);
+      float wn = w + dphi / 6. * (k1w + 2. * k2w + 2. * k3w + k4w);
+      if (!(un < 1.)) break;                    // fell through the horizon (also catches NaN/inf)
+
+      float cn = c * cd - s * sd, sn = s * cd + c * sd;
+      float phin = phi + dphi;
+      float yNew = (cn * e1.y + sn * e2.y) / un;
+
+      if (uDisk > .5 && yPrev * yNew < 0.) {   // crossed the disk plane between the two steps
+        float t = yPrev / (yPrev - yNew);
+        float pc = mix(phi, phin, t), uc = mix(u, un, t), wc = mix(w, wn, t);
+        vec3 er = cos(pc) * e1 + sin(pc) * e2;
+        vec3 et = -sin(pc) * e1 + cos(pc) * e2;
+        vec3 dir = normalize(-h * wc * er + h * uc * et);   // ray direction at the crossing
+        vec4 d = shadeDisk(er / uc, dir);
+        col += trans * d.rgb * d.a;
+        trans *= 1. - d.a;
+        if (trans < .02) break;
+      }
+
+      u = un; w = wn; c = cn; s = sn; phi = phin; yPrev = yNew;
+
+      if (u < 1. / R_FAR && w < 0.) {          // far away and moving outwards: escaped to the sky
+        vec3 er = c * e1 + s * e2;
+        vec3 et = -s * e1 + c * e2;
+        vel = normalize(-h * w * er + h * u * et);
+        escaped = true;
+        break;
+      }
+      if (phi > maxPhi) break;                 // looped more often than the chosen ring order
+    }
+  }
+
+  if (escaped) col += trans * sky(vel);
+
+  // tone map + gamma
+  col = 1. - exp(-col * uExposure);
+  col = pow(col, vec3(1. / 2.2));
+  outColor = vec4(col, 1.);
+}
+</script>
+
+<script>
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl2');
+const errBox = document.getElementById('err');
+function fail(msg) { errBox.style.display = 'block'; errBox.textContent = msg; }
+if (!gl) fail('WebGL2 is not available in this browser.');
+
+const vsSrc = `#version 300 es
+in vec2 p; void main() { gl_Position = vec4(p, 0., 1.); }`;
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) { fail(gl.getShaderInfoLog(s)); throw new Error('shader'); }
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, vsSrc));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, document.getElementById('fs').textContent.trimStart()));
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) fail(gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+
+const buf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+const loc = gl.getAttribLocation(prog, 'p');
+gl.enableVertexAttribArray(loc);
+gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+const U = n => gl.getUniformLocation(prog, n);
+const u = {};
+for (const n of ['uRes','uCam','uRight','uUp','uFwd','uTime','uExposure','uDisk','uSky','uUseSky','uGlyph','uDepth',
+  'uDiskTemp','uDiskPattern','uSkyPattern','uTurb','uTurbScale',
+  'uRedMap','uDoppler','uGravRed','uBeamPow','uBeamOn','uShift','uFocal','uSteps']) u[n] = U(n);
+
+// ---- Parameter definitions: [id, label, type, min, max, step, default, uniform, group] ----
+const P = [
+  // Black hole
+  ['depth',   'Light loops (ring order)','range', 0, 8, 1, 6, 'uDepth', 'Black hole'],
+  // Disk
+  ['disk',    'Accretion disk',       'check', 0, 1,   1,   1,   'uDisk',     'Disk'],
+  ['temp',    'Temperature (K)',      'range', 2000, 20000, 250, 6500, 'uDiskTemp', 'Disk'],
+  ['turb',    'Turbulence',           'range', 0, 1,   .05, 1,   'uTurb',     'Disk'],
+  ['tscale',  'Turbulence scale',     'range', .3, 3,  .1,  1,   'uTurbScale','Disk'],
+  ['spin',    'Rotation speed',       'range', 0, 3,   .1,  1,   null,        'Disk'],
+  // Textures
+  ['dpat',    'Disk letter grid',     'check', 0, 1,   1,   1,   'uDiskPattern', 'Textures'],
+  ['spat',    'Sky letter grid',      'check', 0, 1,   1,   0,   'uSkyPattern',  'Textures'],
+  // Relativistic effects
+  ['rmap',    'Redshift map (false colour)', 'check', 0, 1, 1, 0, 'uRedMap', 'Relativistic effects'],
+  ['shift',   'Colour shift (all)',   'range', 0, 1,   .05, 1,   'uShift',    'Relativistic effects'],
+  ['dopp',    'Doppler (orbit speed)','range', 0, 1.2, .05, 1,   'uDoppler',  'Relativistic effects'],
+  ['grav',    'Gravitational redshift','range', 0, 2,  .05, 1,   'uGravRed',  'Relativistic effects'],
+  ['beamon',  'Relativistic beaming', 'check', 0, 1,   1,   1,   'uBeamOn',   'Relativistic effects'],
+  ['beam',    'Beaming exponent',     'range', 0, 5,   .1,  3,   'uBeamPow',  'Relativistic effects'],
+  // Camera & render
+  ['fov',     'Field of view (deg)',  'range', 20, 120, 1,  100, null,        'Camera & render'],
+  ['dist',    'Distance (rs)',        'range', 4, 80,  .5,  28,  null,        'Camera & render'],
+  ['orbit',   'Auto-orbit speed',     'range', -1, 1,  .02, 0,   null,        'Camera & render'],
+  ['exp',     'Exposure',             'range', .2, 4,  .05, 1.2, 'uExposure', 'Camera & render'],
+  ['steps',   'Ray steps (quality)',  'range', 100, 900, 50, 600, null,       'Camera & render'],
+  ['scale',   'Render scale',         'range', .25, 1, .05, .75, null,        'Camera & render'],
+];
+// ---- Tooltips (shown on hover / keyboard focus / tap on the "i" next to each control) ----
+const TIPS = {
+  depth:  'The photon ring is not painted on: it is computed. Light that passes close to the photon sphere (1.5 r<sub>s</sub>) circles the hole before escaping, and each extra half-loop adds another, exponentially thinner (about 23\u00d7 per half-loop) image of the disk and sky, squeezed against the shadow edge. This sets how many half-loops each ray may make before it is dropped. 0 = only direct images; 2\u20133 already shows a crisp ring; higher adds finer, fainter rings. Cost grows with it.',
+  disk:   'Hot gas spiralling inwards, flattened into a thin disk in the equatorial plane. It runs from 3 r<sub>s</sub> (the innermost stable circular orbit, ISCO — closer than this gas plunges in) out to 14 r<sub>s</sub>. Turn it off to see pure gravitational lensing of the background.',
+  temp:   'Temperature scale of the disk, displayed as blackbody colour (red = cool, white = hotter, blue-white = hottest). The disk is hottest near the inner edge and cools outward. The colour you actually see is then shifted by the Doppler and gravitational effects below.',
+  turb:   'Strength of the clumpy, streaky brightness pattern in the disk. The pattern is sheared by differential rotation (inner gas orbits faster than outer gas). 0 = perfectly smooth disk.',
+  tscale: 'Size of the turbulent clumps. Higher values give smaller, finer structure.',
+  spin:   'How fast the disk animates. Orbital angular speed follows Kepler’s law, Ω ∝ r<sup>–3/2</sup>, so inner rings turn much faster than outer ones. 0 freezes the disk. This only changes the animation speed, not the physics of the image.',
+  dpat:   'Replaces the physical disk glow with a labelled grid: 6 rings (one colour each), letters A…Z around each ring, all starting at the same azimuth. Because the lettering is known, you can see how the image is bent: the disk’s far side is lifted over the top of the hole, and a thinner mirrored copy of it appears underneath, hugging the shadow. That is light from behind the hole reaching you. No relativistic shading in this mode.',
+  spat:   'Replaces the star photo with a latitude/longitude grid (15° cells; rows alternate letters A–X and digits 0–9). Use it to see how lensing stretches, repeats and mirrors the sky — including regions directly behind the black hole, which show up wrapped around the shadow.',
+  rmap:   'Colours every point of the disk by g = ν<sub>observed</sub> / ν<sub>emitted</sub>, the total frequency shift (Doppler × gravitational, with the sliders below applied). <span style="color:#ff6a5a">Red</span> = g &lt; 1, redshifted: gas moving away from you, or deep in the gravity well. <span style="color:#5a8cff">Blue</span> = g &gt; 1, blueshifted: gas moving towards you. White = no shift. Full colour is reached at a frequency factor of about 1.5 (g ≈ 0.67 or 1.5); typical values near the disk’s inner edge are 0.5–1.7. It ignores temperature, exposure and brightness, and overrides the letter grid, so the shift is visible regardless of those settings.',
+  shift:  'Master blend for all frequency shifts. 1 = full Doppler + gravitational shift applied to colour and brightness. 0 = the disk shows its emitted colours as if it were at rest and infinitely far away. Handy for comparing.',
+  dopp:   'Gas near the ISCO orbits at about half the speed of light (v = √(GM/(r–2GM/c²)) in these units). Gas moving towards you is blue-shifted and brighter, gas moving away is red-shifted and dimmer, so one side of the disk looks brighter. The slider scales the orbital speed used: 1 = Keplerian, 0 = no Doppler effect.',
+  grav:   'Light climbing out of a gravity well loses energy. The observed frequency is multiplied by √(1 – r<sub>s</sub>/r): about 0.82 at the inner edge (redder, dimmer), going to 0 at the event horizon. The slider is the exponent: 1 = real general relativity, 0 = off, 2 = exaggerated.',
+  beamon: 'Relativistic beaming: radiation from a fast-moving source is concentrated in its direction of motion. On top of the colour change, gas approaching you gets extra bright and receding gas extra faint. Toggle to compare.',
+  beam:   'Observed brightness scales as g<sup>n</sup>, where g is the total frequency ratio (Doppler × gravitational). n = 3 is the textbook value for a continuous spectrum (n = 4 for total, all-colour intensity). Higher = stronger bright/dim asymmetry.',
+  fov:    'Width of the camera’s view in degrees. Wide shows more sky but more edge distortion; narrow zooms in.',
+  dist:   'Camera distance from the black hole, in Schwarzschild radii. r<sub>s</sub> = 2GM/c² is the event-horizon radius (about 3 km per solar mass). Closer = stronger lensing. Seen from far away, the black hole’s dark shadow has radius ≈ 2.6 r<sub>s</sub> — larger than the horizon itself, because light that passes closer than that gets captured.',
+  orbit:  'Rotates the camera around the black hole automatically. Negative values reverse the direction. Dragging pauses it.',
+  exp:    'Overall brightness before tone-mapping, like camera exposure. Raise it to bring out faint structure; lower it if the disk washes out to white.',
+  steps:  'Quality of the ray integration: higher = smaller angular steps along each light path (the orbit equation is solved with RK4), which gives sharper, more accurate rings and lensing at a higher cost. Low values look coarser and can wobble near the shadow edge.',
+  scale:  'Fraction of the screen resolution the simulation is computed at. Lower = faster but blurrier.'
+};
+const tipEl = document.getElementById('tip');
+let tipFor = null;
+function hideTip() { tipEl.style.display = 'none'; if (tipFor) tipFor.classList.remove('on'); tipFor = null; }
+function showTip(btn, title) {
+  if (tipFor) tipFor.classList.remove('on');
+  tipFor = btn; btn.classList.add('on');
+  tipEl.innerHTML = '<b>' + title + '</b>' + TIPS[btn.dataset.id];
+  tipEl.style.display = 'block';
+  const b = btn.getBoundingClientRect(), hud = document.getElementById('hud').getBoundingClientRect();
+  const w = tipEl.offsetWidth, h = tipEl.offsetHeight, vw = innerWidth, vh = innerHeight;
+  let x = hud.right + 8, y = b.top - 4;
+  if (x + w > vw - 8) { x = Math.max(8, Math.min(b.left - 8, vw - w - 8)); y = b.bottom + 8; if (y + h > vh - 8) y = Math.max(8, b.top - h - 8); }
+  tipEl.style.left = x + 'px'; tipEl.style.top = Math.max(8, Math.min(y, vh - h - 8)) + 'px';
+}
+function makeLabel(id, text) {
+  const s = document.createElement('span'); s.className = 'lbl';
+  s.append(text);
+  if (TIPS[id]) {
+    const i = document.createElement('i');
+    i.className = 'info'; i.textContent = 'i'; i.dataset.id = id; i.tabIndex = 0;
+    i.setAttribute('role', 'button'); i.setAttribute('aria-label', 'About: ' + text);
+    i.addEventListener('mouseenter', () => showTip(i, text));
+    i.addEventListener('mouseleave', hideTip);
+    i.addEventListener('focus', () => showTip(i, text));
+    i.addEventListener('blur', hideTip);
+    // inside a <label>, a click would toggle the control: stop that, and let taps toggle the tip
+    i.addEventListener('click', e => { e.preventDefault(); e.stopPropagation(); tipFor === i ? hideTip() : showTip(i, text); });
+    s.append(i);
+  }
+  return s;
+}
+document.addEventListener('pointerdown', e => { if (!e.target.closest || !e.target.closest('.info')) hideTip(); });
+document.getElementById('hud').addEventListener('scroll', hideTip);
+
+const val = {};              // current values by id
+const inputs = {};
+const ui = document.getElementById('ui');
+let groupEl = null, lastGroup = null;
+for (const [id, label, type, min, max, step, def, uni, group] of P) {
+  if (group !== lastGroup) {
+    groupEl = document.createElement('details');
+    groupEl.open = group === 'Disk' || group === 'Textures';
+    groupEl.innerHTML = `<summary>${group}</summary>`;
+    ui.appendChild(groupEl); lastGroup = group;
+  }
+  const row = document.createElement('label');
+  const inp = document.createElement('input');
+  inp.type = type === 'check' ? 'checkbox' : 'range';
+  if (type === 'range') { inp.min = min; inp.max = max; inp.step = step; }
+  const out = document.createElement('output');
+  const set = v => {
+    val[id] = v;
+    if (type === 'check') inp.checked = !!v; else { inp.value = v; out.textContent = (+v).toFixed(step < .1 ? 2 : step < 1 ? 1 : 0); }
+  };
+  inp.addEventListener('input', () => set(type === 'check' ? (inp.checked ? 1 : 0) : parseFloat(inp.value)));
+  row.append(makeLabel(id, label), ...(type === 'range' ? [Object.assign(document.createElement('span'), { className: 'row' })] : []));
+  if (type === 'range') { row.lastChild.append(inp, out); } else row.append(inp);
+  groupEl.appendChild(row);
+  inputs[id] = { set, def };
+  set(def);
+}
+document.getElementById('reset').onclick = () => { for (const id in inputs) inputs[id].set(inputs[id].def); yaw = 0.6; pitch = 0.16; };
+
+// Glyph atlas (A-Z, 0-9) drawn on a 2D canvas, used by the letter-grid textures.
+(function () {
+  const cs = 64, cv = document.createElement('canvas');
+  cv.width = cs * 8; cv.height = cs * 5;
+  const g = cv.getContext('2d');
+  g.fillStyle = '#000'; g.fillRect(0, 0, cv.width, cv.height);
+  g.fillStyle = '#fff'; g.font = 'bold 46px system-ui, Arial, sans-serif';
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  [...'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'].forEach((ch, i) => g.fillText(ch, (i % 8 + .5) * cs, (Math.floor(i / 8) + .54) * cs));
+  const tex = gl.createTexture();
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, cv);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.activeTexture(gl.TEXTURE0);
+})();
+
+// Orbit camera state (distance is the "dist" parameter)
+let yaw = 0.6, pitch = 0.16;
+// Equirectangular background (assets/stars.jpg|png). Needs to be served over http(s);
+// falls back to the procedural starfield if it can't be loaded.
+let skyReady = 0;
+const skyTex = gl.createTexture();
+(function loadSky(names) {
+  if (!names.length) return;
+  const img = new Image();
+  img.onload = () => {
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, skyTex);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+    gl.generateMipmap(gl.TEXTURE_2D);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    skyReady = 1;
+  };
+  img.onerror = () => loadSky(names.slice(1));
+  img.src = names[0];
+})(['assets/stars.jpg', 'assets/stars.png']);
+
+// Orbit camera state
+canvas.addEventListener('pointerdown', e => { canvas.setPointerCapture(e.pointerId); pts.set(e.pointerId, e); pinch0 = null; });
+const pts = new Map(); let pinch0 = null;
+canvas.addEventListener('pointermove', e => {
+  if (!pts.has(e.pointerId)) return;
+  const prev = pts.get(e.pointerId);
+  pts.set(e.pointerId, e);
+  if (pts.size === 1) {
+    yaw -= (e.clientX - prev.clientX) * 0.005;
+    pitch = Math.max(-1.5, Math.min(1.5, pitch + (e.clientY - prev.clientY) * 0.005));
+  } else if (pts.size === 2) {
+    const [a, b] = [...pts.values()];
+    const d = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+    if (pinch0) inputs.dist.set(clampDist(val.dist * pinch0 / d));
+    pinch0 = d;
+  }
+});
+const endPtr = e => { pts.delete(e.pointerId); pinch0 = null; };
+canvas.addEventListener('pointerup', endPtr);
+canvas.addEventListener('pointercancel', endPtr);
+canvas.addEventListener('wheel', e => { e.preventDefault(); inputs.dist.set(clampDist(val.dist * Math.exp(e.deltaY * 0.001))); }, { passive: false });
+function clampDist(d) { return Math.max(4, Math.min(80, d)); }
+
+const $ = id => document.getElementById(id);
+
+// Collapse / expand the whole control panel (button or the H key)
+const hudEl = $('hud'), collapseBtn = $('collapse');
+function setCollapsed(c) {
+  hudEl.classList.toggle('collapsed', c);
+  collapseBtn.textContent = (c ? '▸' : '▾') + ' Controls';
+  collapseBtn.setAttribute('aria-expanded', String(!c));
+  hideTip();
+}
+collapseBtn.addEventListener('click', () => setCollapsed(!hudEl.classList.contains('collapsed')));
+addEventListener('keydown', e => {
+  if ((e.key === 'h' || e.key === 'H') && !e.ctrlKey && !e.metaKey && !e.altKey) setCollapsed(!hudEl.classList.contains('collapsed'));
+});
+let t0 = performance.now(), last = t0, fpsAvg = 60;
+
+function resize() {
+  const s = val.scale * Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.max(1, Math.floor(canvas.clientWidth * s)), h = Math.max(1, Math.floor(canvas.clientHeight * s));
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+}
+
+function frame(now) {
+  resize();
+  gl.viewport(0, 0, canvas.width, canvas.height);
+
+  const dt = Math.min((now - last) / 1000, 0.1); last = now;
+  simTime += dt * val.spin;
+  if (!pts.size) yaw += dt * val.orbit;
+  fpsAvg += (1 / Math.max(dt, 1e-3) - fpsAvg) * 0.05;
+
+  const dist = val.dist;
+  const cp = Math.cos(pitch), sp = Math.sin(pitch);
+  const pos = [dist * cp * Math.sin(yaw), dist * sp, dist * cp * Math.cos(yaw)];
+  const fwd = pos.map(v => -v / dist);
+  let right = [-fwd[2], 0, fwd[0]];                       // fwd x worldUp
+  const rl = Math.hypot(...right); right = right.map(v => v / rl);
+  const up = [right[1]*fwd[2] - right[2]*fwd[1], right[2]*fwd[0] - right[0]*fwd[2], right[0]*fwd[1] - right[1]*fwd[0]];
+
+  gl.uniform2f(u.uRes, canvas.width, canvas.height);
+  gl.uniform3fv(u.uCam, pos); gl.uniform3fv(u.uRight, right); gl.uniform3fv(u.uUp, up); gl.uniform3fv(u.uFwd, fwd);
+  gl.uniform1f(u.uTime, simTime);
+  gl.uniform1f(u.uFocal, 2 * Math.tan(val.fov * Math.PI / 360));
+  gl.uniform1i(u.uSteps, val.steps);
+  for (const [id, , , , , , , uni] of P) if (uni) gl.uniform1f(u[uni], val[id]);
+  gl.uniform1f(u.uUseSky, skyReady);
+  gl.uniform1i(u.uSky, 0);
+  gl.uniform1i(u.uGlyph, 1);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  $('legend').style.display = val.rmap ? 'block' : 'none';
+  $('info').textContent = `${canvas.width}×${canvas.height} · ${fpsAvg.toFixed(0)} fps`;
+  requestAnimationFrame(frame);
+}
+let simTime = 0;
+if (gl) requestAnimationFrame(frame);
+</script>
+</body>
+</html>
