@@ -4,6 +4,8 @@ A real-time, in-browser simulation of a non-rotating (Schwarzschild) black hole 
 
 **[▶ Live demo](https://mpragliola.github.io/black-hole-relativistic-simulator/)**
 
+[![Black hole with lensed accretion disk, photon ring and the sky behind it](docs/screenshot.jpg)](https://mpragliola.github.io/black-hole-relativistic-simulator/)
+
 ## What you see
 
 - **Gravitational lensing.** Every pixel traces a light ray through curved spacetime, so the starfield behind the hole is bent around it and the far side of the disk is lifted over the top of the shadow.
