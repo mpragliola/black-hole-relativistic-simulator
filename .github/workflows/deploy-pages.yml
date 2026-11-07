@@ -1,0 +1,41 @@
+name: Deploy To GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# contents: write lets the action push to the gh-pages branch.
+permissions:
+  contents: write
+
+# One deploy at a time; a running deploy is allowed to finish rather than being cancelled mid-push.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The site is static, so publish only what the page needs instead of the whole repo.
+      - name: Assemble site
+        run: |
+          mkdir site
+          cp index.html site/
+          cp -r assets site/
+          # Stop GitHub Pages from running Jekyll over the files.
+          touch site/.nojekyll
+
+      # keep_files: true keeps everything already on gh-pages that is not overwritten,
+      # so other content published to this branch is not removed.
+      - name: Deploy to gh-pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
+          publish_dir: ./site
+          keep_files: true
